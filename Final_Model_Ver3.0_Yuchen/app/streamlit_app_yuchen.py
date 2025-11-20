@@ -13,43 +13,6 @@ from ateema.upgrader import run_fill_to_cap
 from ateema.formatting import format_product_block
 from ateema.pricing import apply_discounts
 
-
-# ---------- Awards config (Gabby) ----------
-BASE_DIR = Path(__file__).resolve().parents[1]  # .../Final_Model_Ver2.0_Dazhou
-AWARDS_PATH = BASE_DIR / "Data" / "PriceStrategy" / "AwardsConfig" / "Summit_Awards.json"
-
-try:
-    with AWARDS_PATH.open("r", encoding="utf-8") as f:
-        AWARDS_CONFIG = json.load(f)
-
-    # 1) 所有 general_category，用于下拉框
-    GENERAL_AWARD_CATEGORIES = sorted(
-        {a.get("general_category") for a in AWARDS_CONFIG if a.get("general_category")}
-    )
-
-    # 2) 自动生成 Business Type → Award 的映射
-    BUSINESS_TYPE_TO_AWARD = {}
-
-    for a in AWARDS_CONFIG:
-        award_name = a.get("name")
-        gen_cat = a.get("general_category")
-
-        # 2-1. general_category 本身也可以直接映射到 award
-        if gen_cat and award_name:
-            BUSINESS_TYPE_TO_AWARD[gen_cat] = award_name
-
-        # 2-2. 把 eligible_business_types 也映射到同一个 award
-        for bt in a.get("eligible_business_types", []):
-            if bt and award_name:
-                BUSINESS_TYPE_TO_AWARD.setdefault(bt, award_name)
-
-except Exception as e:
-    AWARDS_CONFIG = []
-    GENERAL_AWARD_CATEGORIES = []
-    BUSINESS_TYPE_TO_AWARD = {}
-    print(f"[WARN] Failed to load Summit_Awards.json: {e}")
-
-
 # ---------- Page ----------
 st.set_page_config(page_title="Ateema – Proposal Builder", page_icon="🧭", layout="wide")
 st.title("Ateema – Proposal Builder")
@@ -138,6 +101,8 @@ def rows_from_selection(
     all_products: set[str],
     prepay_full_year: bool,
     is_advertiser: bool, # Dazhou 11/17 Advertiser
+    billing_date=None, # Yuchen 11/19 Early Bird
+    grand_total: float | None = None, # Yuchen 11/20 Networking Event
 ) -> List[Dict]:
     """
     Build table rows for a pool, applying product-specific discounts.
@@ -160,6 +125,7 @@ def rows_from_selection(
             has_other_products=has_other_products,
             prepay_full_year=prepay_full_year,
             is_advertiser=is_advertiser, # Dazhou 11/17 Advertiser
+            billing_date=billing_date, # Yuchen 11/19 Early-Bird
         )
 
         line_total_original = unit_price_original * qty
@@ -180,6 +146,50 @@ def rows_from_selection(
                 "reasoning": reasoning,
             }
         )
+    
+    # --- Networking Event host/attend (Yuchen 11/20) ---
+
+    if label != "industry":
+        return out
+
+    THRESHOLD = 12500.0
+
+    # grand_total 没传，或者没到阈值：不做额外处理
+    if grand_total is None or grand_total < THRESHOLD:
+        return out
+
+    # 找出当前 rows 里是不是已经有 Network Event
+    network_indices: list[int] = []
+    for idx, row in enumerate(out):
+        pname = (row.get("product") or "").lower()
+        if "network" in pname and "event" in pname:
+            network_indices.append(idx)
+
+    benefit_label = "Included at no cost with $12,500+ investment"
+
+    if network_indices:
+        # 情况 A：用户/allocator 已经选了 Network Event → 把它改成免费
+        for idx in network_indices:
+            row = out[idx]
+            row["unit_price"] = 0.0
+            row["total_price"] = 0.0
+            row["discount"] = benefit_label
+    else:
+        # 情况 B：没选 Network Event，但总消费到 12500 → 自动送一个免费的 Network Event
+        out.append(
+            {
+                "product": "Network Event",
+                "option": "Standard Network Event",
+                "qty": 1,
+                "unit_price_original": 3500.0,
+                "unit_price": 0.0,
+                "discount": benefit_label,
+                "total_price_original": 3500.0,
+                "total_price": 0.0,
+                "reasoning": "Complimentary networking event benefit for $12,500+ investment.",
+            }
+        )
+
 
     return out
 
@@ -262,43 +272,18 @@ else:
         "Billing Date",
         help="This determines seasonal booth pricing such as 4/15–6/14 or 6/15–8/31."
     )
-    business_name = st.text_input("Business Name", value="River North Seasonal Kitchen")
-
-# 原有细分 business types
-    BASE_BUSINESS_TYPES = [
-        "Restaurant - Contemporary American",
-        "Restaurant - Other",
-        "Bar",
-        "Attraction",
-        "Retail",
-    ]
-
-# 在原有选项后面拼接上 awards 的 general_category
-    ALL_BUSINESS_TYPE_OPTIONS = BASE_BUSINESS_TYPES + GENERAL_AWARD_CATEGORIES
-
+    client_name = st.text_input("Business Name", value="River North Seasonal Kitchen")
     business_type = st.selectbox(
         "Business Type",
-        ALL_BUSINESS_TYPE_OPTIONS,
+        ["Restaurant - Contemporary American", "Restaurant - Other", "Bar", "Attraction", "Retail"],
         index=0,
     )
-    
-    # ---------- Auto-match Summit Awards ----------
-    
-    matched_award = BUSINESS_TYPE_TO_AWARD.get(business_type)
-
-    if matched_award:
-        st.success(f"Matched Summit Award: **{matched_award}**")
-    else:
-        st.info("No Summit Award automatically matched for this business type.")
-
-
     audience_type_text = st.selectbox(
         "Audience Type",
         ["Tourist", "Local", "Meeting and Event Planner"],
         index=0,
-        help="Primary audience this proposal is meant to reach.",
+        help="Primary audience this proposal is meant to reach."
     )
-
     focus_text = st.text_area(
         "Focus (what outcome?)",
         value="Launch seasonal tasting menu; boost lunch & pre-theatre reservations",
@@ -309,6 +294,7 @@ else:
         value="Downtown professionals; tourists near River North theatres",
         height=80,
     )
+
 
 
     is_advertiser = st.checkbox("Existing Advertiser?", value=True)
@@ -336,7 +322,7 @@ else:
         try:
             from partner.client_to_product_final import similar_clients_json
             new_client_payload = {
-                "Business Name": business_name,
+                "Business Name": client_name,
                 "Business Type": business_type,
                 "Focus": focus_text,
                 "Market Target": market_text,
@@ -364,9 +350,8 @@ else:
     chosen = st.multiselect("Choose candidate products", options=all_names, default=[])
 
     profile_text = (
-        f"Business Name: {business_name}\n"
+        f"Business Name: {client_name}\n"
         f"Business Type: {business_type}\n"
-        f"Matched Summit Award: {matched_award if matched_award else 'None'}\n"
         f"Audience Type: {audience_type_text}\n"
         f"Focus: {focus_text}\n"
         f"Market Target: {market_text}"
@@ -431,7 +416,7 @@ def make_digital_ads_paragraph(audience_type: str,
 
 
 # Dazhou 11/17 Advertiser
-def _render_table(label: str, sel, all_products: set[str], prepay_full_year: bool, is_advertiser: bool): # Dazhou 11/17 Advertiser
+def _render_table(label: str, sel, all_products: set[str], prepay_full_year: bool, is_advertiser: bool, billing_date=None, grand_total: float | None = None,): # Dazhou 11/17 Advertiser # Yuchen 11/19 Early Bird # Yuchen 11/20 Networking Event
     import pandas as pd
 
     rows = rows_from_selection(
@@ -442,6 +427,8 @@ def _render_table(label: str, sel, all_products: set[str], prepay_full_year: boo
         all_products=all_products,
         prepay_full_year=prepay_full_year,
         is_advertiser=is_advertiser, # Dazhou 11/17 Advertiser
+        billing_date=billing_date, # Yuchen 11/19 Early Bird
+        grand_total=grand_total, # Yuchen 11/20 Networking Event
     )
     if rows:
         st.write(f"**Subtotal (before discounts):** ${sel.subtotal:,.0f}")
@@ -485,16 +472,17 @@ if st.session_state.get("_trigger_generate"):
     t_set, i_set = partition_by_category(subset, {k: meta.get(k, {}) for k in subset.keys()})
     t_sel, i_sel, grand_total = run_fill_to_cap(total_budget, tourist_pct, industry_pct, t_set, i_set, meta, billing_date, is_advertiser=is_advertiser,)
 
+
     # set of all selected products (used for bundle discounts)
     all_products = set(t_sel.picks.keys()) | set(i_sel.picks.keys())
 
     # header ...
     st.subheader("Tourist Pool")
-    _render_table("tourist", t_sel, all_products, prepay_full_year, is_advertiser) # Dazhou 11/17 Advertiser
+    _render_table("tourist", t_sel, all_products, prepay_full_year, is_advertiser, billing_date, grand_total) # Dazhou 11/17 Advertiser # Yuchen 11/19 Early Bird # Yuchen 11/20 Networking Event
     st.markdown("---")
     st.markdown("---")
     st.subheader("Industry Pool")
-    _render_table("industry", i_sel, all_products, prepay_full_year, is_advertiser) # Dazhou 11/17 Advertiser
+    _render_table("industry", i_sel, all_products, prepay_full_year, is_advertiser, billing_date, grand_total) # Dazhou 11/17 Advertiser # Yuchen 11/19 Early Bird # Yuchen 11/20 Networking Event
 
     st.markdown("---")
     st.markdown(f"### Grand Total: ${grand_total:,.0f} (Hard cap = ${total_budget*1.10:,.0f})")
